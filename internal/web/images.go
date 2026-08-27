@@ -73,18 +73,6 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "response_format must be url or b64_json")
 		return
 	}
-	acc, err := s.resolveAccount(firstNonEmpty(b.AccountID, b.User))
-	if err != nil {
-		writeUpstreamError(w, err)
-		return
-	}
-	if acc.OID == "" || acc.TID == "" {
-		acc.OID, acc.TID = extractOIDTID(acc.AccessToken)
-	}
-	if acc.OID == "" || acc.TID == "" {
-		writeOpenAIError(w, 400, "invalid_request_error", "account missing oid/tid — re-login with PKCE")
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ImageTimeoutSeconds)*time.Second)
 	defer cancel()
 	size := b.Size
@@ -101,44 +89,115 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		endpoint = "/v1/images/edits"
 		prompt = fmt.Sprintf("Edit the first attached image with GPT Image 2. Size: %s. Instructions: %s. Preserve everything not requested to change. Return the edited image URL directly.", size, b.Prompt)
 	}
-	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{Text: prompt, Tone: "magic", Attachments: b.Attachments, LicenseType: s.settings.get().LicenseType, Scenario: s.settings.get().Scenario, FeatureFlags: s.featureFlags()})
-	if err != nil {
-		writeUpstreamError(w, err)
-		return
+
+	// Image generation resolves and runs against a single account. When the
+	// upstream refuses with a quota message the model still returns 0 images;
+	// that account is out of image quota, so mark it image-limited (24h) and
+	// try the next healthy account instead of failing immediately. A caller
+	// who pins a specific account (AccountID/User) is not rotated.
+	pinned := firstNonEmpty(b.AccountID, b.User)
+	var acc auth.AccountToken
+	var res chathub.Result
+	var lastRefusal string
+	tried := map[string]bool{}
+	attempts := 1
+	if pinned == "" {
+		attempts = maxAccountProbe
 	}
-	log.Printf("[image-gen] conversation=%s images=%d text_len=%d events=%d raw_len=%d", res.ConversationID, len(res.Images), len(res.Text), len(res.Events), len(res.RawResult))
-	if len(res.Images) == 0 {
-		if urls := extractImageURLs(res.RawResult); len(urls) > 0 {
-			res.Images = urls
+	quotaExhausted := false
+	for i := 0; i < attempts; i++ {
+		var err error
+		if pinned != "" {
+			acc, err = s.resolveAccount(pinned)
+		} else if i == 0 {
+			acc, err = s.resolveAccount("")
+		} else {
+			acc, err = s.nextHealthyAccount(acc.ID)
 		}
-	}
-	if len(res.Images) == 0 {
-		if urls := extractImageURLs(res.Text); len(urls) > 0 {
-			res.Images = urls
+		if err != nil {
+			if i == 0 {
+				writeUpstreamError(w, err)
+				return
+			}
+			break
 		}
-	}
-	if len(res.Images) == 0 {
-		refusalText := strings.Join([]string{res.Text, res.RawResult}, "\n")
+		if tried[acc.ID] {
+			continue
+		}
+		tried[acc.ID] = true
+		if pinned == "" && !s.accountPool.ImageGenAvailable(acc.ID) {
+			// Skip accounts already known to be image-limited/cooling down.
+			continue
+		}
+		if acc.OID == "" || acc.TID == "" {
+			acc.OID, acc.TID = extractOIDTID(acc.AccessToken)
+		}
+		if acc.OID == "" || acc.TID == "" {
+			if pinned != "" {
+				writeOpenAIError(w, 400, "invalid_request_error", "account missing oid/tid — re-login with PKCE")
+				return
+			}
+			continue
+		}
+		r0, gerr := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{Text: prompt, Tone: "magic", Attachments: b.Attachments, LicenseType: s.settings.get().LicenseType, Scenario: s.settings.get().Scenario, FeatureFlags: s.featureFlags()})
+		if gerr != nil {
+			s.accountPool.MarkFailure(acc.ID, gerr, s.getRateLimitCooldown())
+			if pinned != "" {
+				writeUpstreamError(w, gerr)
+				return
+			}
+			continue
+		}
+		log.Printf("[image-gen] account=%s conversation=%s images=%d text_len=%d events=%d raw_len=%d attempt=%d", acc.ID, r0.ConversationID, len(r0.Images), len(r0.Text), len(r0.Events), len(r0.RawResult), i+1)
+		if len(r0.Images) == 0 {
+			if urls := extractImageURLs(r0.RawResult); len(urls) > 0 {
+				r0.Images = urls
+			}
+		}
+		if len(r0.Images) == 0 {
+			if urls := extractImageURLs(r0.Text); len(urls) > 0 {
+				r0.Images = urls
+			}
+		}
+		if len(r0.Images) > 0 {
+			res = r0
+			break
+		}
+		// No images: distinguish quota exhaustion (rotate) from a generic empty.
+		refusalText := strings.Join([]string{r0.Text, r0.RawResult}, "\n")
 		if isImageQuotaRefusal(refusalText) {
-			w.Header().Set("Retry-After", "86400")
-			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "M365 image generation quota is exhausted; try again later or use another account")
-			return
+			quotaExhausted = true
+			lastRefusal = refusalText
+			s.accountPool.MarkImageLimited(acc.ID)
+			log.Printf("[image-gen] account=%s image quota exhausted, rotating", acc.ID)
+			if pinned != "" {
+				break
+			}
+			continue
 		}
-		textPreview := res.Text
+		// Generic empty (not a quota message) is not retryable across accounts.
+		textPreview := r0.Text
 		if len(textPreview) > 500 {
 			textPreview = textPreview[:500]
 		}
-		rawPreview := ""
-		if len(res.RawResult) > 0 {
-			rawPreview = res.RawResult
-			if len(rawPreview) > 500 {
-				rawPreview = rawPreview[:500]
-			}
+		rawPreview := r0.RawResult
+		if len(rawPreview) > 500 {
+			rawPreview = rawPreview[:500]
 		}
-		debug := map[string]any{"text": textPreview, "raw_len": len(res.RawResult), "events": len(res.Events), "images": res.Images, "raw_preview": rawPreview}
-		b, _ := json.Marshal(debug)
-		log.Printf("[image-gen-debug] %s", string(b))
+		debug := map[string]any{"text": textPreview, "raw_len": len(r0.RawResult), "events": len(r0.Events), "images": r0.Images, "raw_preview": rawPreview}
+		dbg, _ := json.Marshal(debug)
+		log.Printf("[image-gen-debug] %s", string(dbg))
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no image resource")
+		return
+	}
+	if len(res.Images) == 0 {
+		if quotaExhausted {
+			_ = lastRefusal
+			w.Header().Set("Retry-After", "86400")
+			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "all accounts' image generation quota is exhausted; try again later")
+			return
+		}
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "no image-capable account available")
 		return
 	}
 	images := res.Images
@@ -171,9 +230,10 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if designerToken == "" {
-			designerToken, err = s.designerAccessToken(acc)
-			if err != nil {
-				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", upstreamError(err))
+			var derr error
+			designerToken, derr = s.designerAccessToken(acc)
+			if derr != nil {
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", upstreamError(derr))
 				return
 			}
 		}
