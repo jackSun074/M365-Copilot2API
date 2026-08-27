@@ -102,7 +102,12 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 			l.RepeatedCall = true
 			l.RepetitionSignature = sig
 		}
-		if seenCall[sig] >= 3 {
+		// A repeated *successful* call is often legitimate agent behavior
+		// (re-reading a file, polling a status), so it must not trip the stuck
+		// guard at the old threshold of 3 — that produced false 409s. Only an
+		// extreme run of identical calls (>=5) is treated as a runaway loop.
+		// Repeated *failures* are handled separately below with a tighter bound.
+		if seenCall[sig] >= 5 {
 			l.StuckLoop = true
 		}
 		if e.Result == "" {
@@ -116,6 +121,9 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 					l.RepeatedFailure = true
 					l.RepetitionSignature = fs
 				}
+				// The same call failing repeatedly is a genuine stuck loop:
+				// retrying an unchanged call that keeps erroring makes no
+				// progress, so cut it off at 3.
 				if seenFailure[fs] >= 3 {
 					l.StuckLoop = true
 				}

@@ -21,7 +21,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -1813,6 +1812,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[mcp] tools=%d mcp_gateway=%s", len(toolMaps), mcpServerURL)
 	}
 	validateCalls := func(stage string, calls []detectedToolCall) ([]detectedToolCall, int) {
+		calls = dedupeToolCalls(calls)
 		valid, rejected := validateDetectedToolCalls(calls, toolMaps, body.ToolChoice)
 		for _, call := range rejected {
 			log.Printf("[tool-validation] id=%s stage=%s rejected_name=%q reason=%q", requestID, stage, call.Name, call.Reason)
@@ -1950,54 +1950,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if ev.Kind != "text" || ev.Text == "" {
 				return nil
 			}
-			text.WriteString(ev.Text)
-			pending.WriteString(ev.Text)
-			v := pending.String()
-			// Detect fenced code blocks (tool calls) that must not be emitted as text.
-			// They will be caught by fencedToolCalls after the stream completes.
-			if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
-				return nil
-			}
-			// If we see an opening ```, buffer until the closing ``` or until we're sure it's not a tool call.
-			if i := strings.Index(v, "```"); i >= 0 {
-				after := v[i+3:]
-				// If there's a closing ```, emit everything up to and including the block.
-				if j := strings.Index(after, "```"); j >= 0 {
-					closeIdx := i + 3 + j + 3
-					if err := emitText(v[:i]); err != nil {
-						return err
-					}
-					pending.Reset()
-					pending.WriteString(v[i:closeIdx])
-					return nil
-				}
-				// Opening ``` without closing yet: emit everything before it, keep the fence buffered.
-				if err := emitText(v[:i]); err != nil {
-					return err
-				}
-				pending.Reset()
-				pending.WriteString(v[i:])
-				return nil
-			}
-			// No fence detected: emit immediately with a small tail buffer for fence detection.
-			// This replaces the old 8-rune threshold with a 3-rune buffer (enough to detect "```").
-			if runeCount := utf8.RuneCountInString(v); runeCount > 3 {
-				cut := 0
-				seen := 0
-				for i := range v {
-					if seen == runeCount-3 {
-						cut = i
-						break
-					}
-					seen++
-				}
-				if err := emitText(v[:cut]); err != nil {
-					return err
-				}
-				pending.Reset()
-				pending.WriteString(v[cut:])
-			}
-			return nil
+			return streamEmitText(ev, &text, &pending, emitText)
 		})
 		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && (IsRateLimited(err) || IsAuthFailure(err)) {
 			originalErr := err
@@ -2023,37 +1976,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					if ev.Kind != "text" || ev.Text == "" {
 						return nil
 					}
-					text.WriteString(ev.Text)
-					pending.WriteString(ev.Text)
-					v := pending.String()
-					if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
-						return nil
-					}
-					if i := strings.Index(v, "```"); i >= 0 {
-						if err := emitText(v[:i]); err != nil {
-							return err
-						}
-						pending.Reset()
-						pending.WriteString(v[i:])
-						return nil
-					}
-					if runeCount := utf8.RuneCountInString(v); runeCount > 8 {
-						cut := 0
-						seen := 0
-						for i := range v {
-							if seen == runeCount-8 {
-								cut = i
-								break
-							}
-							seen++
-						}
-						if err := emitText(v[:cut]); err != nil {
-							return err
-						}
-						pending.Reset()
-						pending.WriteString(v[cut:])
-					}
-					return nil
+					return streamEmitText(ev, &text, &pending, emitText)
 				})
 				if err2 == nil {
 					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
