@@ -4,7 +4,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/m365-copilot2api ./cmd/server
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X m365-copilot2api/internal/web.Version=${VERSION}" -o /out/m365-copilot2api ./cmd/server
 
 FROM alpine:3.20
 RUN addgroup -S m365 && adduser -S -G m365 m365 \

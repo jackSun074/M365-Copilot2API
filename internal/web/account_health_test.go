@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,7 +92,7 @@ func TestAccountHealthLifecycle(t *testing.T) {
 	}
 }
 
-func TestCooldownExpiryClearsCallCount(t *testing.T) {
+func TestCooldownExpiryEntersHalfOpen(t *testing.T) {
 	h := newAccountHealth()
 	const id = "acct-expiry"
 	h.MarkCall(id)
@@ -99,32 +101,23 @@ func TestCooldownExpiryClearsCallCount(t *testing.T) {
 	h.mu.Lock()
 	h.cooldown[id] = time.Now().Add(-time.Second)
 	h.mu.Unlock()
-	if !h.Available(id) {
-		t.Fatal("expired cooldown must be available")
+	if h.Available(id) {
+		t.Fatal("expired rate-limit cooldown must remain unavailable until a probe succeeds")
 	}
-	if h.CallCount(id) != 0 {
-		t.Fatalf("call count=%d want 0", h.CallCount(id))
+	if !h.RateLimited(id) {
+		t.Fatal("expired cooldown must preserve rate-limit state")
 	}
-	if h.RateLimited(id) {
-		t.Fatal("expired cooldown still marked limited")
+	if !h.TryAcquire(id) {
+		t.Fatal("first request after cooldown must acquire the half-open probe")
 	}
-	h.MarkCall(id)
-	h.MarkFailure(id, &UpstreamHTTPError{Status: 429}, time.Minute)
-	h.mu.Lock()
-	h.cooldown[id] = time.Now().Add(-time.Second)
-	h.mu.Unlock()
-	if _, ok := h.CooldownUntil(id); ok || h.CallCount(id) != 0 {
-		t.Fatal("CooldownUntil must clear expired call count")
+	if h.TryAcquire(id) {
+		t.Fatal("only one half-open probe may run per account")
 	}
-	h.MarkCall(id)
-	h.MarkFailure(id, &UpstreamHTTPError{Status: 429}, time.Minute)
-	h.mu.Lock()
-	h.cooldown[id] = time.Now().Add(-time.Second)
-	h.mu.Unlock()
-	h.MarkCall(id)
-	if h.CallCount(id) != 1 {
-		t.Fatalf("post-cooldown call count=%d want 1", h.CallCount(id))
+	h.MarkSuccess(id)
+	if !h.Available(id) || h.RateLimited(id) {
+		t.Fatal("successful probe must restore scheduling and clear rate-limit state")
 	}
+
 	const authID = "acct-auth-expiry"
 	h.MarkCall(authID)
 	h.MarkFailure(authID, &UpstreamHTTPError{Status: 401}, time.Minute)
@@ -133,6 +126,63 @@ func TestCooldownExpiryClearsCallCount(t *testing.T) {
 	h.mu.Unlock()
 	if !h.Available(authID) || h.CallCount(authID) != 1 {
 		t.Fatal("auth cooldown must not clear call count")
+	}
+}
+
+func TestHalfOpenProbeRateLimitedAgain(t *testing.T) {
+	h := newAccountHealth()
+	const id = "acct-retry"
+	h.MarkFailure(id, &UpstreamHTTPError{Status: 429, RetryAfter: 90}, time.Minute)
+	h.mu.Lock()
+	h.cooldown[id] = time.Now().Add(-time.Second)
+	h.mu.Unlock()
+	if !h.TryAcquire(id) {
+		t.Fatal("half-open probe was not acquired")
+	}
+	h.MarkFailure(id, &UpstreamHTTPError{Status: 429, RetryAfter: 90}, time.Minute)
+	until, ok := h.CooldownUntil(id)
+	if !ok || time.Until(until) < 89*time.Second {
+		t.Fatalf("429 probe result did not re-enter Retry-After cooldown: %v", until)
+	}
+}
+
+func TestHalfOpenAllowsSingleConcurrentProbe(t *testing.T) {
+	h := newAccountHealth()
+	const id = "acct-concurrent-probe"
+	h.MarkFailure(id, &UpstreamHTTPError{Status: 429}, time.Minute)
+	h.mu.Lock()
+	h.cooldown[id] = time.Now().Add(-time.Second)
+	h.mu.Unlock()
+
+	const workers = 64
+	start := make(chan struct{})
+	var acquired atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if h.TryAcquire(id) {
+				acquired.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := acquired.Load(); got != 1 {
+		t.Fatalf("half-open probes=%d want 1", got)
+	}
+}
+
+func BenchmarkAccountHealthTryAcquire(b *testing.B) {
+	h := newAccountHealth()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !h.TryAcquire("benchmark-account") {
+			b.Fatal("healthy account unexpectedly unavailable")
+		}
 	}
 }
 
@@ -224,6 +274,41 @@ func TestResolveAccountSkipsSchedulingDisabled(t *testing.T) {
 	}
 }
 
+func TestResolveBoundAccountSkipsUnboundAccounts(t *testing.T) {
+	store := testAccountFiles(t)
+	s := &Server{tokens: store, accountPool: newAccountHealth()}
+
+	acc, err := s.resolveBoundAccount([]string{"u-2", "u-3"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "u-2" && acc.ID != "u-3" {
+		t.Fatalf("selected unbound account %q", acc.ID)
+	}
+}
+
+func TestResolveBoundAccountSkipsDisabledAndUnhealthy(t *testing.T) {
+	store := testAccountFiles(t)
+	if err := store.SetScheduleEnabled("u-2", false); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{tokens: store, accountPool: newAccountHealth()}
+	s.accountPool.MarkFailure("u-3", &UpstreamHTTPError{Status: 429}, 10*time.Minute)
+
+	if _, err := s.resolveBoundAccount([]string{"u-2", "u-3"}, ""); err == nil {
+		t.Fatal("expected failure when every bound account is unavailable")
+	}
+}
+
+func TestResolveBoundAccountRejectsExplicitUnboundAccount(t *testing.T) {
+	store := testAccountFiles(t)
+	s := &Server{tokens: store, accountPool: newAccountHealth()}
+
+	if _, err := s.resolveBoundAccount([]string{"u-2", "u-3"}, "u-1"); err == nil {
+		t.Fatal("expected explicit unbound account to be rejected")
+	}
+}
+
 func TestResolveAccountAllUnhealthy(t *testing.T) {
 	store := testAccountFiles(t)
 	s := &Server{tokens: store, accountPool: newAccountHealth()}
@@ -240,7 +325,7 @@ func TestNextHealthyAccount(t *testing.T) {
 	s := &Server{tokens: store, accountPool: newAccountHealth()}
 
 	s.accountPool.MarkFailure("u-2", &UpstreamHTTPError{Status: 429}, 10*time.Minute)
-	acc, err := s.nextHealthyAccount("u-1")
+	acc, err := s.nextHealthyAccount("u-1", nil)
 	if err != nil {
 		t.Fatalf("nextHealthyAccount: %v", err)
 	}
@@ -254,8 +339,63 @@ func TestNextHealthyAccount(t *testing.T) {
 	for _, id := range []string{"u-1", "u-2", "u-3"} {
 		s.accountPool.MarkFailure(id, &UpstreamHTTPError{Status: 429}, 10*time.Minute)
 	}
-	if _, err := s.nextHealthyAccount(""); err == nil {
+	if _, err := s.nextHealthyAccount("", nil); err == nil {
 		t.Fatal("nextHealthyAccount must fail when no healthy account remains")
+	}
+}
+
+func TestNextHealthyAccountStaysWithinBoundAccounts(t *testing.T) {
+	store := testAccountFiles(t)
+	s := &Server{tokens: store, accountPool: newAccountHealth()}
+
+	s.accountPool.MarkFailure("u-1", &UpstreamHTTPError{Status: 429}, 10*time.Minute)
+	acc, err := s.nextHealthyAccount("u-1", []string{"u-1", "u-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "u-2" {
+		t.Fatalf("bound failover account=%s want u-2", acc.ID)
+	}
+
+	s.accountPool.MarkFailure("u-2", &UpstreamHTTPError{Status: 401}, 10*time.Minute)
+	if _, err := s.nextHealthyAccount("u-1", []string{"u-1", "u-2"}); err == nil || err.Error() != "no bound account available" {
+		t.Fatalf("error=%v want no bound account available", err)
+	}
+}
+
+func TestChatStreamRejectsExplicitUnboundAccount(t *testing.T) {
+	const rawKey = "bound-stream-key"
+	store := testAccountFiles(t)
+	keys := newAPIKeyStore(filepath.Join(t.TempDir(), "api-keys.json"))
+	keys.Keys = []apiKeyRecord{{Hash: keyHash(rawKey), AccountIDs: []string{"u-2"}}}
+	s := &Server{tokens: store, apiKeys: keys, accountPool: newAccountHealth()}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/chat/stream", strings.NewReader(`{"accountId":"u-1","message":"hello"}`))
+	r.Header.Set("Authorization", "Bearer "+rawKey)
+	s.chatStream(w, r)
+
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "upstream request failed") {
+		t.Fatalf("status=%d body=%s want masked unbound-account rejection", w.Code, w.Body.String())
+	}
+}
+
+func TestChatStreamDoesNotFallBackOutsideUnavailableBoundAccounts(t *testing.T) {
+	const rawKey = "unavailable-bound-stream-key"
+	store := testAccountFiles(t)
+	keys := newAPIKeyStore(filepath.Join(t.TempDir(), "api-keys.json"))
+	keys.Keys = []apiKeyRecord{{Hash: keyHash(rawKey), AccountIDs: []string{"u-1", "u-2"}}}
+	s := &Server{tokens: store, apiKeys: keys, accountPool: newAccountHealth()}
+	s.accountPool.MarkFailure("u-1", &UpstreamHTTPError{Status: http.StatusTooManyRequests}, time.Minute)
+	s.accountPool.MarkFailure("u-2", &UpstreamHTTPError{Status: http.StatusUnauthorized}, time.Minute)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/chat/stream", strings.NewReader(`{"message":"hello"}`))
+	r.Header.Set("Authorization", "Bearer "+rawKey)
+	s.chatStream(w, r)
+
+	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "upstream request failed") {
+		t.Fatalf("status=%d body=%s want masked bound-account exhaustion error", w.Code, w.Body.String())
 	}
 }
 
@@ -425,5 +565,58 @@ func TestAccountHealthMeteringDefaultsDeepCopySnapshotAndReset(t *testing.T) {
 	}
 	if meterError, hasAccess, remaining := h.GetMetering(id); meterError != "" || !hasAccess || len(remaining) != 0 {
 		t.Fatalf("reset left metering state: error=%q access=%v remaining=%v", meterError, hasAccess, remaining)
+	}
+}
+
+func TestRemainingAllowanceSnapshotBecomesStaleWithoutBeingDeleted(t *testing.T) {
+	h := newAccountHealth()
+	const id = "acct-snapshot"
+	h.UpdateMetering(id, "", true, map[string]int{"Chat": 17})
+
+	h.UpdateMetering(id, "denied", false, nil)
+	snapshot := h.Snapshot()[id]
+	if snapshot["remainingAllowance"].(map[string]int)["Chat"] != 17 {
+		t.Fatal("denied metering must preserve the last allowance snapshot")
+	}
+	if snapshot["remainingAllowanceStale"] != true {
+		t.Fatal("denied metering must mark the allowance snapshot stale")
+	}
+	if snapshot["remainingAllowanceUpdatedAt"].(time.Time).IsZero() {
+		t.Fatal("allowance snapshot must include its update time")
+	}
+
+	h.UpdateMetering(id, "", true, nil)
+	if h.Snapshot()[id]["remainingAllowanceStale"] != true {
+		t.Fatal("success without fresh allowance data must not revive a stale snapshot")
+	}
+}
+
+func TestRateLimitMarksRemainingAllowanceSnapshotStale(t *testing.T) {
+	h := newAccountHealth()
+	const id = "acct-rate-limited"
+	h.UpdateMetering(id, "", true, map[string]int{"Chat": 9})
+	h.MarkFailure(id, &UpstreamHTTPError{Status: http.StatusTooManyRequests}, time.Minute)
+	if h.Snapshot()[id]["remainingAllowanceStale"] != true {
+		t.Fatal("rate limiting must mark the prior allowance snapshot stale")
+	}
+}
+
+func TestGlobalCooldownMarksRemainingAllowanceSnapshotStale(t *testing.T) {
+	ResetGlobalCircuit()
+	defer ResetGlobalCircuit()
+	globalCircuit.mu.Lock()
+	globalCircuit.openUntil = time.Now().Add(time.Minute)
+	globalCircuit.mu.Unlock()
+
+	h := newAccountHealth()
+	const id = "acct-global-unavailable"
+	h.UpdateMetering(id, "", true, map[string]int{"Chat": 11})
+	h.MarkFailure(id, fmt.Errorf("request rejected while global circuit is open"), time.Minute)
+	snapshot := h.Snapshot()[id]
+	if snapshot["remainingAllowanceStale"] != true {
+		t.Fatal("global cooldown must mark the prior allowance snapshot stale")
+	}
+	if snapshot["available"] != false {
+		t.Fatal("global cooldown account must be unavailable")
 	}
 }

@@ -12,6 +12,7 @@ import (
 )
 
 var ErrOffensiveContent = errors.New("upstream content policy flagged as offensive")
+var ErrAccountNotBound = errors.New("account is not available for this API key")
 
 func logOAuthError(stage string, err error) {
 	var oauthErr *auth.OAuthError
@@ -36,6 +37,9 @@ func upstreamError(err error) string {
 // rate limits stay 429 (with Retry-After when known), auth failures become 401,
 // everything else is 502. Unknown upstream failures must never leak internals.
 func upstreamStatus(err error) int {
+	if errors.Is(err, ErrAccountNotBound) {
+		return http.StatusForbidden
+	}
 	if errors.Is(err, chathub.ErrOffensiveContent) {
 		return http.StatusServiceUnavailable
 	}

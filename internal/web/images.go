@@ -26,6 +26,7 @@ const (
 	maxImageEditRequestBytes = maxGeneratedImageBytes + (2 << 20)
 	generatedImageTTL        = 15 * time.Minute
 	maxGeneratedImages       = 128
+	maxImageAccountProbe     = 16
 )
 
 type generatedImage struct {
@@ -100,9 +101,10 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	var res chathub.Result
 	var lastRefusal string
 	tried := map[string]bool{}
+	accountIDs := s.apiKeys.accountIDs(rawAPIKey(r))
 	attempts := 1
 	if pinned == "" {
-		attempts = maxAccountProbe
+		attempts = maxImageAccountProbe
 	}
 	quotaExhausted := false
 	for i := 0; i < attempts; i++ {
@@ -112,7 +114,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		} else if i == 0 {
 			acc, err = s.resolveAccount("")
 		} else {
-			acc, err = s.nextHealthyAccount(acc.ID)
+			acc, err = s.nextHealthyAccount(acc.ID, accountIDs)
 		}
 		if err != nil {
 			if i == 0 {

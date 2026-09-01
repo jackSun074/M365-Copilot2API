@@ -98,7 +98,7 @@ func (s *Server) accountAvailable(accountID string) bool {
 	if s.tokens != nil && !s.tokens.ScheduleEnabled(accountID) {
 		return false
 	}
-	return s.accountPool.Available(accountID) && s.accountConcurrency.Available(accountID)
+	return s.accountConcurrency.Available(accountID) && s.accountPool.TryAcquire(accountID)
 }
 
 func (s *Server) accountClient(accountID string) *chathub.Client {

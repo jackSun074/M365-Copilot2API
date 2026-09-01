@@ -99,6 +99,24 @@ func masterKey() []byte {
 	return mac.Sum(nil)
 }
 
+func HasMasterKey() bool {
+	return strings.TrimSpace(os.Getenv("M365_MASTER_KEY")) != "" || strings.TrimSpace(os.Getenv("M365_TOKEN_ENCRYPTION_KEY")) != ""
+}
+
+func EncryptSecret(plain string) (string, error) {
+	if !HasMasterKey() {
+		return "", errors.New("M365_MASTER_KEY is required")
+	}
+	return encryptRefreshToken(plain)
+}
+
+func DecryptSecret(encrypted string) (string, error) {
+	if !HasMasterKey() {
+		return "", errors.New("M365_MASTER_KEY is required")
+	}
+	return decryptRefreshToken(encrypted)
+}
+
 func isEncrypted(s string) bool { return strings.HasPrefix(s, encPrefix) }
 
 func encryptRefreshToken(plain string) (string, error) {

@@ -389,6 +389,14 @@ func (c *Client) ChatWithReasoning(ctx context.Context, acc Account, req Request
 	})
 }
 
+// A pre-warmed websocket is created with its own conversation/session IDs.
+// It is safe for a fresh first turn, whose IDs are also generated locally, but
+// not for continuing an existing upstream conversation. Microsoft can finish
+// such mismatched continuation requests immediately with no answer text.
+func shouldReusePooledConnection(req Request) bool {
+	return req.ConversationID == "" && req.SessionID == ""
+}
+
 func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler) (Result, error) {
 	startedAt := time.Now()
 	log.Printf("chathub timing start prompt_len=%d", len(req.Text))
@@ -430,7 +438,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var connWriteMu *sync.Mutex
 	var poolFrames <-chan []byte
 	var poolErrs <-chan error
-	if c.Pool != nil {
+	if c.Pool != nil && shouldReusePooledConnection(req) {
 		var poolErr error
 		conn, connWriteMu, poolFrames, poolErrs, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL)
 		if poolErr != nil {
@@ -457,9 +465,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if err != nil {
 			if resp != nil && (resp.StatusCode == 429 || resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 503) {
 				retryAfter := 0
-				if v, _ := strconv.Atoi(resp.Header.Get("Retry-After")); v > 0 {
-					retryAfter = v
-				}
+				retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 				log.Printf("chathub ws_dial %d Retry-After=%d", resp.StatusCode, retryAfter)
 				kind := ""
 				switch resp.StatusCode {
@@ -1151,6 +1157,21 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// they were a successful, finished answer.
 	returnConn = false
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
+}
+
+func parseRetryAfter(value string, now time.Time) int {
+	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds > 0 {
+		return seconds
+	}
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+	seconds := int(when.Sub(now).Seconds())
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 // finalizeText reconciles the incrementally streamed text with the
