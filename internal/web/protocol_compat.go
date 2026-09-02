@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"m365-copilot2api/internal/chathub"
@@ -149,8 +150,14 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		f := map[string]any{"name": t["name"], "description": t["description"], "parameters": t["parameters"]}
 		if typ == "custom" && name == "exec" {
 			return o, fmt.Errorf("unsupported_parameter: tools")
-		} else if typ != "function" {
-			return o, fmt.Errorf("unsupported_parameter: tools")
+		}
+		if typ != "function" {
+			// Newer Codex clients declare non-function tools (local_shell,
+			// custom apply_patch, web_search, ...). The gateway executes only
+			// client-side function tools, so skip the rest instead of
+			// rejecting the whole request with 400.
+			log.Printf("[responses] skipping unsupported tool type %q (name=%q)", typ, name)
+			continue
 		}
 		b, _ := json.Marshal(f)
 		o.Tools = append(o.Tools, chathub.Tool{Type: typ, Function: b})
