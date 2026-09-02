@@ -34,18 +34,14 @@ type responsesRequest struct {
 
 func (r responsesRequest) openAI() (oaiReq, error) {
 	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream, ToolChoice: r.ToolChoice, ParallelToolCalls: r.ParallelToolCalls, Reasoning: r.Reasoning, User: r.User}
-	if len(r.Include) != 0 {
-		return o, fmt.Errorf("unsupported_parameter: include")
-	}
-	if len(r.Text) != 0 {
-		return o, fmt.Errorf("unsupported_parameter: text")
-	}
-	if r.ServiceTier != "" {
-		return o, fmt.Errorf("unsupported_parameter: service_tier")
-	}
-	if r.ContextManagement != nil {
-		return o, fmt.Errorf("unsupported_parameter: context_management")
-	}
+	// include/text/service_tier/context_management are parsed but deliberately
+	// ignored: the gateway has no semantics for them and newer Codex clients
+	// always send include (e.g. reasoning.encrypted_content) on /responses.
+	// Rejecting them turns every Codex request into a 400, so tolerate them.
+	_ = r.Include
+	_ = r.Text
+	_ = r.ServiceTier
+	_ = r.ContextManagement
 	if r.Temperature != nil {
 		o.Temperature = r.Temperature
 	}
